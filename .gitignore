@@ -2,4 +2,5 @@
 test.py
 build/
 dist/
+__pycache__/
 test.spec
