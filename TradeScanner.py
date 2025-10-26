@@ -1,0 +1,168 @@
+import os
+import time
+import json
+import logging
+import requests
+import pandas as pd
+import ccxt
+from datetime import datetime
+from dotenv import load_dotenv
+
+# === CUSTOM MODULES ===
+from ProtectedHighLowDetector import ProtectedHighLowDetector
+from OrderBlockDetector import OrderBlockDetector
+from FvgDetector import FVGDetector
+from PoiDetector import POIDetector
+from NotifierTelegram import NotifierTelegram
+
+# ===================== LOAD ENVIRONMENT VARIABLES =====================
+load_dotenv()
+
+# --- Telegram ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS", "").split(",")
+Telegram_proxy_address = None
+
+# --- Exchange & Proxy ---
+USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
+PROXY_ADDR = os.getenv("PROXY_ADDR")
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+
+# --- Trading Config ---
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL", 60))
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", 14))
+PIVOT_LEFT = int(os.getenv("PIVOT_LEFT", 3))
+PIVOT_RIGHT = int(os.getenv("PIVOT_RIGHT", 3))
+MIN_BREAK_MULT = float(os.getenv("MIN_BREAK_MULT", 0))
+FILTER_SIGNALS = os.getenv("FILTER_SIGNALS", "true").lower() == "true"
+AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"
+STRICT_LEVEL = os.getenv("STRICT_LEVEL", "medium")
+RR_RATIO = float(os.getenv("RR_RATIO", 1))
+ENTRY_MODE = os.getenv("ENTRY_MODE", "CURRENT_PRICE")
+PLACE_TRADE_IN_THREAD = os.getenv("PLACE_TRADE_IN_THREAD", "false").lower() == "true"
+ORDER_VALUE_USDT = float(os.getenv("ORDER_VALUE_USDT", 20.0))
+AUTO_SET_ORDER_VALUE = os.getenv("AUTO_SET_ORDER_VALUE", "false").lower() == "true"
+USE_ORDER_BLOCK = os.getenv("USE_ORDER_BLOCK", "true").lower() == "true"
+
+# --- Symbol List ---
+SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+
+# ===================== EXCHANGE SETUP =====================
+if USE_PROXY:
+    Telegram_proxy_address = PROXY_ADDR
+    session = requests.Session()
+    session.trust_env = False
+    session.proxies = {"http": PROXY_ADDR, "https": PROXY_ADDR}
+    EXCHANGE = ccxt.binance({
+        "session": session,
+        "enableRateLimit": True,
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+    })
+else:
+    EXCHANGE = ccxt.binance({
+        "enableRateLimit": True,
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+    })
+
+# ===================== LOGGER SETUP =====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s,%(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# ===================== TELEGRAM NOTIFIER =====================
+notifier = NotifierTelegram(
+    bot_token=TELEGRAM_BOT_TOKEN,
+    chat_ids=TELEGRAM_CHAT_IDS,
+    atr_len=ATR_PERIOD,
+    symbol_precision=2,
+    request_timeout=30,
+    proxy=Telegram_proxy_address,
+)
+
+# ===================== FETCH OHLCV =====================
+def fetch_ohlcv(symbol, timeframe, limit=200):
+    """Fetch recent OHLCV data"""
+    print(f"📊 Fetching {limit} candles for {symbol} ({timeframe}) ...")
+    data = EXCHANGE.fetch_ohlcv(symbol, timeframe, limit=limit)
+    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    return df
+
+# ===================== ANALYSIS =====================
+def analyze_symbol(symbol, last_sent_poi):
+    try:
+        df = fetch_ohlcv(symbol, TIMEFRAME)
+
+        phl = ProtectedHighLowDetector(
+            left=PIVOT_LEFT,
+            right=PIVOT_RIGHT,
+            min_break_atr_mult=MIN_BREAK_MULT,
+            atr_len=3
+        )
+        ob = OrderBlockDetector(
+            swing_length=10,
+            max_atr_mult=3.5,
+            atr_len=3,
+            ob_end_method="Wick",
+            combine_obs=True,
+            max_orderblocks=30,
+            max_boxes_count=500,
+            overlap_threshold_percentage=0.0,
+        )
+        fvg = FVGDetector(fvg_history_limit=10, reduce_mitigated=True)
+
+        poi_detector = POIDetector(
+            config={"swing_proximity": 3},
+            protected_detector=phl,
+            ob_detector=ob,
+            fvg_detector=fvg,
+            symbol=symbol,
+            timeframe=TIMEFRAME,
+        )
+
+        result = poi_detector.find_pois(df)
+        pois = result.get("pois", [])
+
+        if pois:
+            latest_poi = pois[-1]
+            poi_id = f"{latest_poi['poi_index']}_{latest_poi.get('fvg_index', '')}_{latest_poi['protected_type']}"
+
+            if last_sent_poi.get(symbol) != poi_id:
+                notifier.send_poi(latest_poi, df)
+                logging.info(f"{symbol},POI,{json.dumps(latest_poi)}")
+                last_sent_poi[symbol] = poi_id
+            else:
+                logging.info(f"{symbol},POI_SKIPPED,Duplicate POI — not sent")
+        else:
+            logging.info(f"{symbol},NO_POI,No POIs detected")
+
+    except Exception as e:
+        logging.error(f"{symbol},ERROR,{e}")
+
+# ===================== MAIN LOOP =====================
+def main_loop():
+    print(f"🔍 Monitoring {len(SYMBOLS)} pairs on {TIMEFRAME} timeframe\n")
+    last_sent_poi = {symbol: None for symbol in SYMBOLS}
+
+    while True:
+        for symbol in SYMBOLS:
+            analyze_symbol(symbol, last_sent_poi)
+
+        print(f"\n🕒 Cycle complete. Waiting {LOOP_INTERVAL}s before next scan...", end="", flush=True)
+        for sec in range(LOOP_INTERVAL, 0, -1):
+            print(f"\r🕒 Next cycle in {sec:02d}s...", end="", flush=True)
+            time.sleep(1)
+        print("\r🕒 Starting next cycle...                           ", flush=True)
+
+# ===================== ENTRY POINT =====================
+if __name__ == "__main__":
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Script stopped by user.")
