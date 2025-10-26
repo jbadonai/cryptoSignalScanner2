@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 import time
-
+from zoneinfo import ZoneInfo  # ✅ add this import at the top of the file
 
 import requests
 import pandas as pd
@@ -30,7 +30,7 @@ class NotifierTelegram:
         proxy: str = None,
         request_timeout: int = 30,
         max_retries: int = 3,
-        project_tag: str = "@jbadonaiventures V3"
+        project_tag: str = "@jbadonaiventures V4"
     ):
         self.bot_token = bot_token
         self.chat_ids = chat_ids if isinstance(chat_ids, list) else [chat_ids]
@@ -68,6 +68,8 @@ class NotifierTelegram:
     # Message building
     # -------------------------------------------------------------------------
 
+
+
     def _build_message(self, poi: dict, df: pd.DataFrame, timeframe: str = "15m") -> str:
         """Build formatted Telegram message similar to the user’s preferred format."""
         atr_val = self._calculate_atr(df)
@@ -83,7 +85,7 @@ class NotifierTelegram:
 
         # Trade setup
         if is_bullish:
-            limit_entry = fvg_top if fvg_top is not None  else ""
+            limit_entry = fvg_top if fvg_top is not None else ""
             stop_loss = protected_price - atr_val
         else:
             limit_entry = fvg_bottom if fvg_bottom is not None else ""
@@ -94,12 +96,21 @@ class NotifierTelegram:
 
         current_price = df["close"].iloc[-1]
         detected_price = protected_price
+
+        # ✅ Convert UTC timestamp to Nigeria Time (WAT)
         detected_time = poi.get("timestamp", "N/A")
+        try:
+            if detected_time != "N/A":
+                utc_dt = pd.to_datetime(detected_time, utc=True)
+                wat_dt = utc_dt.astimezone(ZoneInfo("Africa/Lagos"))
+                detected_time = wat_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+        except Exception as tz_err:
+            detected_time = f"{detected_time} (tz_conv_fail: {tz_err})"
 
         msg = (
             f"<pre><b>📢 NEW SIGNAL DETECTED - {timeframe.upper()}</b></pre>\n"
-            f"<b>PAIR:</b> <i>🪙 {poi['symbol']} 🪙</i>\n"
-            f"<b>{signal_type}:</b> <i>@{self._fmt(detected_price)}</i>\n"
+            f"<b>PAIR:</b> <i>🪙 {poi['symbol']} 🪙 {poi['symbol']}.P </i>\n"
+            f"<b>{'Bullish' if is_bullish else 'Bearish'} OB + {protected_type}:</b> <i>@{self._fmt(detected_price)}</i>\n"
             f"ORDER BLOCK: <b>{'Bullish' if is_bullish else 'Bearish'}</b> @ {self._fmt(ob_top)} / {self._fmt(ob_bottom)}\n\n"
             f"<pre><b>Trade Setup</b></pre>\n"
             f"<b>SIGNAL:</b> <i>{trade_type}</i>\n"

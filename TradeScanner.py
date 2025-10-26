@@ -26,8 +26,6 @@ Telegram_proxy_address = None
 # --- Exchange & Proxy ---
 USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
 PROXY_ADDR = os.getenv("PROXY_ADDR")
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
 
 # --- Trading Config ---
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
@@ -55,18 +53,9 @@ if USE_PROXY:
     session = requests.Session()
     session.trust_env = False
     session.proxies = {"http": PROXY_ADDR, "https": PROXY_ADDR}
-    EXCHANGE = ccxt.binance({
-        "session": session,
-        "enableRateLimit": True,
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-    })
+    EXCHANGE = ccxt.binance({"session": session, "enableRateLimit": True})
 else:
-    EXCHANGE = ccxt.binance({
-        "enableRateLimit": True,
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-    })
+    EXCHANGE = ccxt.binance({"enableRateLimit": True})
 
 # ===================== LOGGER SETUP =====================
 logging.basicConfig(
@@ -93,6 +82,7 @@ def fetch_ohlcv(symbol, timeframe, limit=200):
     df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
+
 
 # ===================== ANALYSIS =====================
 def analyze_symbol(symbol, last_sent_poi):
@@ -129,21 +119,64 @@ def analyze_symbol(symbol, last_sent_poi):
         result = poi_detector.find_pois(df)
         pois = result.get("pois", [])
 
-        if pois:
-            latest_poi = pois[-1]
-            poi_id = f"{latest_poi['poi_index']}_{latest_poi.get('fvg_index', '')}_{latest_poi['protected_type']}"
-
-            if last_sent_poi.get(symbol) != poi_id:
-                notifier.send_poi(latest_poi, df)
-                logging.info(f"{symbol},POI,{json.dumps(latest_poi)}")
-                last_sent_poi[symbol] = poi_id
-            else:
-                logging.info(f"{symbol},POI_SKIPPED,Duplicate POI — not sent")
-        else:
+        if not pois:
             logging.info(f"{symbol},NO_POI,No POIs detected")
+            return
+
+        latest_poi = pois[-1]
+        poi_id = f"{latest_poi['poi_index']}_{latest_poi.get('fvg_index', '')}_{latest_poi['protected_type']}"
+
+        ob_top, ob_bottom = latest_poi["ob_top"], latest_poi["ob_bottom"]
+        fvg_top, fvg_bottom = latest_poi["fvg_top"], latest_poi["fvg_bottom"]
+        protected_price = latest_poi["protected_price"]
+        current_price = df["close"].iloc[-1]
+
+        # === Degenerate POI Filter ===
+        if (
+            ob_top is None or ob_bottom is None or
+            abs(ob_top - ob_bottom) < 1e-6 or
+            abs(protected_price - current_price) < 1e-8
+        ):
+            logging.info(f"{symbol},POI_SKIPPED,Degenerate OB or protected level (flat or invalid)")
+            return
+
+        # === ATR Validation ===
+        atr_val = notifier._calculate_atr(df)
+        if (
+            atr_val is None or pd.isna(atr_val) or
+            atr_val == 0 or atr_val < 1e-6 or
+            atr_val / current_price < 0.00005
+        ):
+            logging.info(f"{symbol},POI_SKIPPED,ATR too small or invalid (ATR={atr_val})")
+            return
+
+        # === Mislabel Correction ===
+        if "Low" in latest_poi["protected_type"] and protected_price > current_price:
+            logging.warning(f"{symbol},CORRECTION,Protected Low above price -> relabeled as High")
+            latest_poi["protected_type"] = "Protected High"
+        elif "High" in latest_poi["protected_type"] and protected_price < current_price:
+            logging.warning(f"{symbol},CORRECTION,Protected High below price -> relabeled as Low")
+            latest_poi["protected_type"] = "Protected Low"
+
+        # === Duplicate Signal Check ===
+        if last_sent_poi.get(symbol) == poi_id:
+            logging.info(f"{symbol},POI_SKIPPED,Duplicate POI — not sent")
+            return
+
+        # === Build Telegram Message (only if valid ATR) ===
+        msg = notifier._build_message(latest_poi, df, timeframe=TIMEFRAME)
+        if not msg or "ATR(14):</b> <i>0.00" in msg:
+            logging.info(f"{symbol},POI_SKIPPED,Invalid or zero ATR in message — not sent")
+            return
+
+        notifier.send_poi(latest_poi, df)
+        logging.info(f"{symbol},POI,{json.dumps(latest_poi)}")
+        last_sent_poi[symbol] = poi_id
 
     except Exception as e:
         logging.error(f"{symbol},ERROR,{e}")
+
+
 
 # ===================== MAIN LOOP =====================
 def main_loop():
@@ -159,6 +192,7 @@ def main_loop():
             print(f"\r🕒 Next cycle in {sec:02d}s...", end="", flush=True)
             time.sleep(1)
         print("\r🕒 Starting next cycle...                           ", flush=True)
+
 
 # ===================== ENTRY POINT =====================
 if __name__ == "__main__":
