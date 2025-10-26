@@ -14,6 +14,7 @@ from OrderBlockDetector import OrderBlockDetector
 from FvgDetector import FVGDetector
 from PoiDetector import POIDetector
 from NotifierTelegram import NotifierTelegram
+from AdvancedTrendDetector import AdvancedTrendDetector  # 🧩 Added Trend Detector
 
 # ===================== LOAD ENVIRONMENT VARIABLES =====================
 load_dotenv()
@@ -44,8 +45,16 @@ ORDER_VALUE_USDT = float(os.getenv("ORDER_VALUE_USDT", 20.0))
 AUTO_SET_ORDER_VALUE = os.getenv("AUTO_SET_ORDER_VALUE", "false").lower() == "true"
 USE_ORDER_BLOCK = os.getenv("USE_ORDER_BLOCK", "true").lower() == "true"
 
+# --- Trend Filter ---
+USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "false").lower() == "true"
+TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
+
 # --- Symbol List ---
-SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+SYMBOLS = [
+    s.strip().upper()
+    for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+    if s.strip()  # ensures no empty symbols
+]
 
 # ===================== EXCHANGE SETUP =====================
 if USE_PROXY:
@@ -53,7 +62,10 @@ if USE_PROXY:
     session = requests.Session()
     session.trust_env = False
     session.proxies = {"http": PROXY_ADDR, "https": PROXY_ADDR}
-    EXCHANGE = ccxt.binance({"session": session, "enableRateLimit": True})
+    EXCHANGE = ccxt.binance({
+        "session": session,
+        "enableRateLimit": True,
+    })
 else:
     EXCHANGE = ccxt.binance({"enableRateLimit": True})
 
@@ -74,6 +86,9 @@ notifier = NotifierTelegram(
     proxy=Telegram_proxy_address,
 )
 
+# ===================== TREND DETECTOR =====================
+trend_detector = AdvancedTrendDetector(ema_length=50, adx_length=14, adx_threshold=20)
+
 # ===================== FETCH OHLCV =====================
 def fetch_ohlcv(symbol, timeframe, limit=200):
     """Fetch recent OHLCV data"""
@@ -83,8 +98,9 @@ def fetch_ohlcv(symbol, timeframe, limit=200):
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
-
 # ===================== ANALYSIS =====================
+import hashlib
+
 def analyze_symbol(symbol, last_sent_poi):
     try:
         df = fetch_ohlcv(symbol, TIMEFRAME)
@@ -124,8 +140,6 @@ def analyze_symbol(symbol, last_sent_poi):
             return
 
         latest_poi = pois[-1]
-        poi_id = f"{latest_poi['poi_index']}_{latest_poi.get('fvg_index', '')}_{latest_poi['protected_type']}"
-
         ob_top, ob_bottom = latest_poi["ob_top"], latest_poi["ob_bottom"]
         fvg_top, fvg_bottom = latest_poi["fvg_top"], latest_poi["fvg_bottom"]
         protected_price = latest_poi["protected_price"]
@@ -135,10 +149,15 @@ def analyze_symbol(symbol, last_sent_poi):
         if (
             ob_top is None or ob_bottom is None or
             abs(ob_top - ob_bottom) < 1e-6 or
+            abs(fvg_top - fvg_bottom) < 1e-6 or
             abs(protected_price - current_price) < 1e-8
         ):
-            logging.info(f"{symbol},POI_SKIPPED,Degenerate OB or protected level (flat or invalid)")
+            logging.info(f"{symbol},POI_SKIPPED,Degenerate POI values detected (flat structure)")
             return
+
+        # === Debug: Identical Prices Warning ===
+        if len({protected_price, ob_top, ob_bottom, fvg_top, fvg_bottom, current_price}) == 1:
+            logging.warning(f"{symbol},WARNING,All prices identical -> possible detection bug")
 
         # === ATR Validation ===
         atr_val = notifier._calculate_atr(df)
@@ -158,9 +177,19 @@ def analyze_symbol(symbol, last_sent_poi):
             logging.warning(f"{symbol},CORRECTION,Protected High below price -> relabeled as Low")
             latest_poi["protected_type"] = "Protected Low"
 
-        # === Duplicate Signal Check ===
-        if last_sent_poi.get(symbol) == poi_id:
-            logging.info(f"{symbol},POI_SKIPPED,Duplicate POI — not sent")
+        # === Generate Strong Unique POI Signature ===
+        poi_signature_str = (
+            f"{symbol}_{TIMEFRAME}_"
+            f"{latest_poi['protected_type']}_"
+            f"{round(protected_price, 4)}_"
+            f"{round(ob_top or 0, 4)}_{round(ob_bottom or 0, 4)}_"
+            f"{round(fvg_top or 0, 4)}_{round(fvg_bottom or 0, 4)}"
+        )
+        poi_hash = hashlib.sha256(poi_signature_str.encode()).hexdigest()
+
+        # === Check for Duplicate Signal ===
+        if last_sent_poi.get(symbol) == poi_hash:
+            logging.info(f"{symbol},POI_SKIPPED,Duplicate POI signature — not sent")
             return
 
         # === Build Telegram Message (only if valid ATR) ===
@@ -169,18 +198,20 @@ def analyze_symbol(symbol, last_sent_poi):
             logging.info(f"{symbol},POI_SKIPPED,Invalid or zero ATR in message — not sent")
             return
 
+        # === Send ===
         notifier.send_poi(latest_poi, df)
         logging.info(f"{symbol},POI,{json.dumps(latest_poi)}")
-        last_sent_poi[symbol] = poi_id
+        last_sent_poi[symbol] = poi_hash
 
     except Exception as e:
         logging.error(f"{symbol},ERROR,{e}")
 
-
-
 # ===================== MAIN LOOP =====================
 def main_loop():
     print(f"🔍 Monitoring {len(SYMBOLS)} pairs on {TIMEFRAME} timeframe\n")
+    if USE_TREND_FILTER:
+        print(f"📈 Trend Filter Enabled ({TREND_TIMEFRAME})\n")
+
     last_sent_poi = {symbol: None for symbol in SYMBOLS}
 
     while True:
@@ -192,7 +223,6 @@ def main_loop():
             print(f"\r🕒 Next cycle in {sec:02d}s...", end="", flush=True)
             time.sleep(1)
         print("\r🕒 Starting next cycle...                           ", flush=True)
-
 
 # ===================== ENTRY POINT =====================
 if __name__ == "__main__":
