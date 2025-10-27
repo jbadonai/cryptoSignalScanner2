@@ -320,15 +320,17 @@ def analyze_symbol(symbol: str):
             logging.info(f"{symbol},POI_SKIPPED,ATR invalid or too small ({atr_val})")
             return
 
-        # --- Mislabel correction (swap wrong side) ---
+        # --- Mislabel correction ---
         if "Low" in protected_type and protected_price > current_price:
             latest_poi["protected_type"] = "Protected High"
         elif "High" in protected_type and protected_price < current_price:
             latest_poi["protected_type"] = "Protected Low"
 
-        # --- Smarter duplicate signature (structure-based, rounded to 3 decimals) ---
+        # --- Structural duplicate signature (ignore entries, TP, SL, ATR) ---
         side = "BUY" if "Low" in latest_poi["protected_type"] else "SELL"
-        key_price = round(protected_price, 3)
+
+        # Round to reduce float noise, ensure same structure hashes identically
+        key_price = round(protected_price or 0, 3)
         ob_top_r = round(ob_top or 0, 3)
         ob_bottom_r = round(ob_bottom or 0, 3)
         fvg_top_r = round(fvg_top or 0, 3)
@@ -336,7 +338,9 @@ def analyze_symbol(symbol: str):
 
         poi_signature_str = (
             f"{symbol}_{TIMEFRAME}_{side}_"
-            f"{key_price}_{ob_top_r}_{ob_bottom_r}_{fvg_top_r}_{fvg_bottom_r}"
+            f"PL{key_price}_"
+            f"OB{ob_top_r}-{ob_bottom_r}_"
+            f"FVG{fvg_top_r}-{fvg_bottom_r}"
         )
         poi_hash = hashlib.sha256(poi_signature_str.encode()).hexdigest()
 
@@ -348,7 +352,7 @@ def analyze_symbol(symbol: str):
                 logging.info(f"{symbol},POI_SKIPPED,Duplicate POI (persistent)")
                 return
 
-        # --- Message validation ---
+        # --- Build and validate message ---
         msg = notifier._build_message(latest_poi, df_tail, timeframe=TIMEFRAME)
         if not msg or f"ATR({ATR_PERIOD}):</b> <i>0.00" in msg:
             logging.info(f"{symbol},POI_SKIPPED,Invalid or zero ATR in message")
@@ -362,13 +366,8 @@ def analyze_symbol(symbol: str):
         with state_lock:
             last_sent_poi[symbol] = {"hash": poi_hash, "timestamp": time.time()}
 
-        # write persistent hashes once per cycle in main_loop
-        # (handled in main loop to avoid file writes from multiple threads)
-
     except Exception as e:
         logging.error(f"{symbol},ERROR,{e}")
-
-
 
 
 
