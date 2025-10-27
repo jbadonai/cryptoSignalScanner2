@@ -294,17 +294,15 @@ def analyze_symbol(symbol: str):
         latest_poi = pois[-1]
         ob_top = latest_poi.get("ob_top")
         ob_bottom = latest_poi.get("ob_bottom")
-        fvg_top = latest_poi.get("fvg_top")
-        fvg_bottom = latest_poi.get("fvg_bottom")
         protected_price = latest_poi.get("protected_price")
         protected_type = latest_poi.get("protected_type", "")
+        order_block_type = latest_poi.get("order_block_type", "")  # Bullish / Bearish expected
         current_price = float(df_tail["close"].iloc[-1])
 
         # --- Quick degeneracy filters ---
         if (
             ob_top is None or ob_bottom is None or
             abs((ob_top or 0) - (ob_bottom or 0)) < 1e-8 or
-            abs((fvg_top or 0) - (fvg_bottom or 0)) < 1e-8 or
             protected_price is None or abs(protected_price - current_price) < 1e-8
         ):
             logging.info(f"{symbol},POI_SKIPPED,Degenerate POI values")
@@ -320,36 +318,34 @@ def analyze_symbol(symbol: str):
             logging.info(f"{symbol},POI_SKIPPED,ATR invalid or too small ({atr_val})")
             return
 
-        # --- Mislabel correction ---
+        # --- Direction and label correction ---
         if "Low" in protected_type and protected_price > current_price:
             latest_poi["protected_type"] = "Protected High"
         elif "High" in protected_type and protected_price < current_price:
             latest_poi["protected_type"] = "Protected Low"
 
-        # --- Structural duplicate signature (ignore entries, TP, SL, ATR) ---
+        # Derive signal side (BUY for Protected Low, SELL for Protected High)
         side = "BUY" if "Low" in latest_poi["protected_type"] else "SELL"
 
-        # Round to reduce float noise, ensure same structure hashes identically
-        key_price = round(protected_price or 0, 3)
+        # --- Build clean signature (only the consistent fields you requested) ---
         ob_top_r = round(ob_top or 0, 3)
         ob_bottom_r = round(ob_bottom or 0, 3)
-        fvg_top_r = round(fvg_top or 0, 3)
-        fvg_bottom_r = round(fvg_bottom or 0, 3)
+        key_protected_type = latest_poi["protected_type"]
+        key_ob_type = order_block_type or ("Bullish" if side == "BUY" else "Bearish")
 
         poi_signature_str = (
-            f"{symbol}_{TIMEFRAME}_{side}_"
-            f"PL{key_price}_"
-            f"OB{ob_top_r}-{ob_bottom_r}_"
-            f"FVG{fvg_top_r}-{fvg_bottom_r}"
+            f"{symbol}_{side}_{key_protected_type}_"
+            f"{key_ob_type}_"
+            f"OB{ob_top_r}-{ob_bottom_r}"
         )
         poi_hash = hashlib.sha256(poi_signature_str.encode()).hexdigest()
 
-        # --- Duplicate protection check (persistent) ---
+        # --- Check for duplicate ---
         with state_lock:
             prev_entry = last_sent_poi.get(symbol)
             prev_hash = prev_entry.get("hash") if isinstance(prev_entry, dict) else prev_entry
             if prev_hash == poi_hash:
-                logging.info(f"{symbol},POI_SKIPPED,Duplicate POI (persistent)")
+                logging.info(f"{symbol},POI_SKIPPED,Duplicate POI (same structure)")
                 return
 
         # --- Build and validate message ---
@@ -362,12 +358,13 @@ def analyze_symbol(symbol: str):
         notifier.send_poi(latest_poi, df_tail)
         logging.info(f"{symbol},POI_SENT,{json.dumps(latest_poi)}")
 
-        # --- Save hash for persistence ---
+        # --- Save persistent hash ---
         with state_lock:
             last_sent_poi[symbol] = {"hash": poi_hash, "timestamp": time.time()}
 
     except Exception as e:
         logging.error(f"{symbol},ERROR,{e}")
+
 
 
 
