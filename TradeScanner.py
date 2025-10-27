@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import time
 import json
@@ -5,16 +6,19 @@ import logging
 import requests
 import pandas as pd
 import ccxt
-from datetime import datetime
+import hashlib
+from datetime import datetime, timezone
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
-# === CUSTOM MODULES ===
+# === CUSTOM MODULES (same as before) ===
 from ProtectedHighLowDetector import ProtectedHighLowDetector
 from OrderBlockDetector import OrderBlockDetector
 from FvgDetector import FVGDetector
 from PoiDetector import POIDetector
 from NotifierTelegram import NotifierTelegram
-from AdvancedTrendDetector import AdvancedTrendDetector  # 🧩 Added Trend Detector
+from AdvancedTrendDetector import AdvancedTrendDetector
 
 # ===================== LOAD ENVIRONMENT VARIABLES =====================
 load_dotenv()
@@ -49,11 +53,61 @@ USE_ORDER_BLOCK = os.getenv("USE_ORDER_BLOCK", "true").lower() == "true"
 USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "false").lower() == "true"
 TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
 
+HEARTBEAT_INTERVAL = 60  # seconds
+
+PERSIST_FILE = "last_sent_poi.json"
+POI_RETENTION_DAYS = 3  # auto-clean entries older than 3 days
+
+
+
+def load_last_sent_poi():
+    """Load persistent duplicate POI hashes from disk."""
+    try:
+        if os.path.exists(PERSIST_FILE):
+            with open(PERSIST_FILE, "r") as f:
+                data = json.load(f)
+
+            # If old format (string hash only), upgrade to dict
+            upgraded = {}
+            for sym, val in data.items():
+                if isinstance(val, str):
+                    upgraded[sym] = {"hash": val, "timestamp": time.time()}
+                else:
+                    upgraded[sym] = val
+            data = upgraded
+
+            logging.info(f"Loaded persistent POI hashes for {len(data)} symbols.")
+            return data
+    except Exception as e:
+        logging.warning(f"Failed to load {PERSIST_FILE}: {e}")
+    return {}
+
+def save_last_sent_poi():
+    """Write last_sent_poi to disk safely with auto-cleaning."""
+    try:
+        cutoff = time.time() - (POI_RETENTION_DAYS * 86400)
+        with state_lock:
+            # remove entries older than retention
+            cleaned = {
+                s: d for s, d in last_sent_poi.items()
+                if d and d.get("timestamp", 0) >= cutoff
+            }
+            if len(cleaned) < len(last_sent_poi):
+                logging.info(f"Cleaned {len(last_sent_poi) - len(cleaned)} old POI entries.")
+            last_sent_poi.clear()
+            last_sent_poi.update(cleaned)
+
+            with open(PERSIST_FILE, "w") as f:
+                json.dump(last_sent_poi, f)
+    except Exception as e:
+        logging.error(f"Failed to save {PERSIST_FILE}: {e}")
+
+
 # --- Symbol List ---
 SYMBOLS = [
     s.strip().upper()
     for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
-    if s.strip()  # ensures no empty symbols
+    if s.strip()
 ]
 
 # ===================== EXCHANGE SETUP =====================
@@ -72,7 +126,7 @@ else:
 # ===================== LOGGER SETUP =====================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s,%(message)s",
+    format="%(asctime)s,%(levelname)s,%(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
@@ -86,53 +140,151 @@ notifier = NotifierTelegram(
     proxy=Telegram_proxy_address,
 )
 
-# ===================== TREND DETECTOR =====================
+# ===================== TREND DETECTOR (single instance) =====================
 trend_detector = AdvancedTrendDetector(ema_length=50, adx_length=14, adx_threshold=20)
 
-# ===================== FETCH OHLCV =====================
-def fetch_ohlcv(symbol, timeframe, limit=200):
-    """Fetch recent OHLCV data"""
-    print(f"📊 Fetching {limit} candles for {symbol} ({timeframe}) ...")
-    data = EXCHANGE.fetch_ohlcv(symbol, timeframe, limit=limit)
-    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    return df
-
-# ===================== ANALYSIS =====================
-import hashlib
-
-def analyze_symbol(symbol, last_sent_poi):
+# ================ UTIL: timeframe -> milliseconds =================
+def timeframe_to_ms(tf: str) -> int:
+    """
+    Convert timeframe strings like '1m', '15m', '1h', '4h', '1d' to milliseconds.
+    If unknown format, default to 1 minute.
+    """
+    tf = tf.strip().lower()
     try:
-        df = fetch_ohlcv(symbol, TIMEFRAME)
+        if tf.endswith("m"):
+            return int(tf[:-1]) * 60_000
+        if tf.endswith("h"):
+            return int(tf[:-1]) * 60 * 60_000
+        if tf.endswith("d"):
+            return int(tf[:-1]) * 24 * 60 * 60_000
+    except Exception:
+        pass
+    # fallback: 1 minute
+    return 60_000
 
-        phl = ProtectedHighLowDetector(
-            left=PIVOT_LEFT,
-            right=PIVOT_RIGHT,
-            min_break_atr_mult=MIN_BREAK_MULT,
-            atr_len=3
-        )
-        ob = OrderBlockDetector(
-            swing_length=10,
-            max_atr_mult=3.5,
-            atr_len=3,
-            ob_end_method="Wick",
-            combine_obs=True,
-            max_orderblocks=30,
-            max_boxes_count=500,
-            overlap_threshold_percentage=0.0,
-        )
-        fvg = FVGDetector(fvg_history_limit=10, reduce_mitigated=True)
+TIMEFRAME_MS = timeframe_to_ms(TIMEFRAME)
 
-        poi_detector = POIDetector(
-            config={"swing_proximity": 3},
-            protected_detector=phl,
-            ob_detector=ob,
-            fvg_detector=fvg,
-            symbol=symbol,
-            timeframe=TIMEFRAME,
-        )
+# ===================== DETECTORS: instantiate once per symbol =====================
+def create_detectors_for_symbol(symbol: str):
+    phl = ProtectedHighLowDetector(
+        left=PIVOT_LEFT,
+        right=PIVOT_RIGHT,
+        min_break_atr_mult=MIN_BREAK_MULT,
+        atr_len=3
+    )
+    ob = OrderBlockDetector(
+        swing_length=10,
+        max_atr_mult=3.5,
+        atr_len=3,
+        ob_end_method="Wick",
+        combine_obs=True,
+        max_orderblocks=30,
+        max_boxes_count=500,
+        overlap_threshold_percentage=0.0,
+    )
+    fvg = FVGDetector(fvg_history_limit=10, reduce_mitigated=True)
 
-        result = poi_detector.find_pois(df)
+    poi = POIDetector(
+        config={"swing_proximity": 3},
+        protected_detector=phl,
+        ob_detector=ob,
+        fvg_detector=fvg,
+        symbol=symbol,
+        timeframe=TIMEFRAME,
+    )
+
+    return {"phl": phl, "ob": ob, "fvg": fvg, "poi": poi}
+
+detectors = {s: create_detectors_for_symbol(s) for s in SYMBOLS}
+
+# ===================== CACHES & STATE =====================
+ohlcv_cache = {s: pd.DataFrame() for s in SYMBOLS}  # cached DataFrame per symbol
+last_candle_ts = {s: None for s in SYMBOLS}        # last candle timestamp (pd.Timestamp)
+
+# last_sent_poi = {s: None for s in SYMBOLS}         # last sent poi hash per symbol
+last_sent_poi = load_last_sent_poi()
+for s in SYMBOLS:
+    last_sent_poi.setdefault(s, None)
+
+# concurrency lock for shared state updates
+state_lock = Lock()
+
+# ===================== FETCH OHLCV (incremental) =====================
+def fetch_ohlcv_incremental(symbol: str, timeframe: str, since: int = None, limit: int = 200):
+    """
+    Fetch only new candles since `since` (ms). If since is None, fetch `limit` candles.
+    Returns list of ohlcv rows as returned by ccxt.
+    """
+    # ccxt expects since in ms or None
+    params = {}
+    try:
+        if since:
+            data = EXCHANGE.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+        else:
+            data = EXCHANGE.fetch_ohlcv(symbol, timeframe, limit=limit)
+        return data
+    except Exception as e:
+        logging.error(f"{symbol},FETCH_ERROR,{e}")
+        return []
+
+def update_cache_for_symbol(symbol: str):
+    """
+    Fetch recent candles and update the cached DataFrame.
+    Returns tuple (df, new_candle_added: bool)
+    """
+    global ohlcv_cache, last_candle_ts
+
+    prev_last_ts = last_candle_ts.get(symbol)
+    since_ms = None
+    if prev_last_ts is not None:
+        # fetch after last stored timestamp (convert to ms + 1 to avoid duplication)
+        since_ms = int(prev_last_ts.timestamp() * 1000) + 1
+
+    raw = fetch_ohlcv_incremental(symbol, TIMEFRAME, since=since_ms, limit=200)
+
+    if not raw:
+        # no new data
+        return ohlcv_cache[symbol], False
+
+    df_new = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+    df_new["ts"] = pd.to_datetime(df_new["ts"], unit="ms", utc=True)
+
+    # combine with existing cache
+    if ohlcv_cache[symbol].empty:
+        df_combined = df_new
+    else:
+        df_combined = pd.concat([ohlcv_cache[symbol], df_new], ignore_index=True)
+        # drop duplicates by timestamp and keep last
+        df_combined = df_combined.drop_duplicates(subset=["ts"], keep="last")
+
+    # keep a reasonable window — detectors likely don't need >500 candles
+    df_combined = df_combined.sort_values("ts").tail(500).reset_index(drop=True)
+    ohlcv_cache[symbol] = df_combined
+
+    new_last_ts = df_combined["ts"].iloc[-1]
+    added = (prev_last_ts is None) or (new_last_ts > prev_last_ts)
+
+    with state_lock:
+        last_candle_ts[symbol] = new_last_ts
+
+    return df_combined, added
+
+# ===================== ANALYSIS per SYMBOL =====================
+def analyze_symbol(symbol: str):
+    try:
+        df, added = update_cache_for_symbol(symbol)
+        if df.empty:
+            logging.info(f"{symbol},NO_DATA,No OHLCV cached")
+            return
+
+        if not added:
+            logging.debug(f"{symbol},SKIP,No new candle")
+            return
+
+        poi_detector = detectors[symbol]["poi"]
+        df_tail = df.tail(300).copy()
+
+        result = poi_detector.find_pois(df_tail)
         pois = result.get("pois", [])
 
         if not pois:
@@ -140,93 +292,130 @@ def analyze_symbol(symbol, last_sent_poi):
             return
 
         latest_poi = pois[-1]
-        ob_top, ob_bottom = latest_poi["ob_top"], latest_poi["ob_bottom"]
-        fvg_top, fvg_bottom = latest_poi["fvg_top"], latest_poi["fvg_bottom"]
-        protected_price = latest_poi["protected_price"]
-        current_price = df["close"].iloc[-1]
+        ob_top, ob_bottom = latest_poi.get("ob_top"), latest_poi.get("ob_bottom")
+        fvg_top, fvg_bottom = latest_poi.get("fvg_top"), latest_poi.get("fvg_bottom")
+        protected_price = latest_poi.get("protected_price")
+        current_price = float(df_tail["close"].iloc[-1])
 
-        # === Degenerate POI Filter ===
+        # Quick degenerate filters
         if (
             ob_top is None or ob_bottom is None or
-            abs(ob_top - ob_bottom) < 1e-6 or
-            abs(fvg_top - fvg_bottom) < 1e-6 or
-            abs(protected_price - current_price) < 1e-8
+            abs((ob_top or 0) - (ob_bottom or 0)) < 1e-8 or
+            abs((fvg_top or 0) - (fvg_bottom or 0)) < 1e-8 or
+            protected_price is None or abs(protected_price - current_price) < 1e-8
         ):
-            logging.info(f"{symbol},POI_SKIPPED,Degenerate POI values detected (flat structure)")
+            logging.info(f"{symbol},POI_SKIPPED,Degenerate POI values")
             return
 
-        # === Debug: Identical Prices Warning ===
-        if len({protected_price, ob_top, ob_bottom, fvg_top, fvg_bottom, current_price}) == 1:
-            logging.warning(f"{symbol},WARNING,All prices identical -> possible detection bug")
-
-        # === ATR Validation ===
-        atr_val = notifier._calculate_atr(df)
+        # ATR sanity check
+        atr_val = notifier._calculate_atr(df_tail)
         if (
             atr_val is None or pd.isna(atr_val) or
-            atr_val == 0 or atr_val < 1e-6 or
+            atr_val == 0 or atr_val < 1e-8 or
             atr_val / current_price < 0.00005
         ):
-            logging.info(f"{symbol},POI_SKIPPED,ATR too small or invalid (ATR={atr_val})")
+            logging.info(f"{symbol},POI_SKIPPED,ATR invalid or too small ({atr_val})")
             return
 
-        # === Mislabel Correction ===
-        if "Low" in latest_poi["protected_type"] and protected_price > current_price:
-            logging.warning(f"{symbol},CORRECTION,Protected Low above price -> relabeled as High")
+        # Mislabel correction
+        if "Low" in latest_poi.get("protected_type", "") and protected_price > current_price:
             latest_poi["protected_type"] = "Protected High"
-        elif "High" in latest_poi["protected_type"] and protected_price < current_price:
-            logging.warning(f"{symbol},CORRECTION,Protected High below price -> relabeled as Low")
+        elif "High" in latest_poi.get("protected_type", "") and protected_price < current_price:
             latest_poi["protected_type"] = "Protected Low"
 
-        # === Generate Strong Unique POI Signature ===
+        # Unique hash to prevent duplicates
         poi_signature_str = (
             f"{symbol}_{TIMEFRAME}_"
-            f"{latest_poi['protected_type']}_"
+            f"{latest_poi.get('protected_type')}_"
             f"{round(protected_price, 4)}_"
             f"{round(ob_top or 0, 4)}_{round(ob_bottom or 0, 4)}_"
             f"{round(fvg_top or 0, 4)}_{round(fvg_bottom or 0, 4)}"
         )
         poi_hash = hashlib.sha256(poi_signature_str.encode()).hexdigest()
 
-        # === Check for Duplicate Signal ===
-        if last_sent_poi.get(symbol) == poi_hash:
-            logging.info(f"{symbol},POI_SKIPPED,Duplicate POI signature — not sent")
+        with state_lock:
+            prev_entry = last_sent_poi.get(symbol)
+            prev_hash = prev_entry.get("hash") if isinstance(prev_entry, dict) else prev_entry
+            if prev_hash == poi_hash:
+                logging.info(f"{symbol},POI_SKIPPED,Duplicate POI (persistent)")
+                return
+
+        msg = notifier._build_message(latest_poi, df_tail, timeframe=TIMEFRAME)
+        if not msg or f"ATR({ATR_PERIOD}):</b> <i>0.00" in msg:
+            logging.info(f"{symbol},POI_SKIPPED,Invalid or zero ATR in message")
             return
 
-        # === Build Telegram Message (only if valid ATR) ===
-        msg = notifier._build_message(latest_poi, df, timeframe=TIMEFRAME)
-        if not msg or "ATR(14):</b> <i>0.00" in msg:
-            logging.info(f"{symbol},POI_SKIPPED,Invalid or zero ATR in message — not sent")
-            return
+        notifier.send_poi(latest_poi, df_tail)
+        logging.info(f"{symbol},POI_SENT,{json.dumps(latest_poi)}")
 
-        # === Send ===
-        notifier.send_poi(latest_poi, df)
-        logging.info(f"{symbol},POI,{json.dumps(latest_poi)}")
-        last_sent_poi[symbol] = poi_hash
+        # Update in-memory state (timestamped)
+        with state_lock:
+            last_sent_poi[symbol] = {"hash": poi_hash, "timestamp": time.time()}
 
     except Exception as e:
         logging.error(f"{symbol},ERROR,{e}")
 
+
+
+
 # ===================== MAIN LOOP =====================
 def main_loop():
-    print(f"🔍 Monitoring {len(SYMBOLS)} pairs on {TIMEFRAME} timeframe\n")
+    logging.info(f"Starting monitor for {len(SYMBOLS)} symbols on {TIMEFRAME}")
     if USE_TREND_FILTER:
-        print(f"📈 Trend Filter Enabled ({TREND_TIMEFRAME})\n")
+        logging.info(f"Trend filter enabled ({TREND_TIMEFRAME})")
 
-    last_sent_poi = {symbol: None for symbol in SYMBOLS}
+    # warm caches once at start but keep lightweight (fetch last small window)
+    logging.info("Priming OHLCV cache...")
+    counter = 0
+    for s in SYMBOLS:
+        counter += 1
+        try:
+            print(f"\r[{counter}/{len(SYMBOLS)}]Priming {s}...", end="")
+            df_init = EXCHANGE.fetch_ohlcv(s, TIMEFRAME, limit=200)
+            if df_init:
+                df_init = pd.DataFrame(df_init, columns=["ts", "open", "high", "low", "close", "volume"])
+                df_init["ts"] = pd.to_datetime(df_init["ts"], unit="ms", utc=True)
+                ohlcv_cache[s] = df_init.sort_values("ts").tail(500).reset_index(drop=True)
+                last_candle_ts[s] = ohlcv_cache[s]["ts"].iloc[-1]
+        except Exception as e:
+            logging.warning(f"{s},INIT_FETCH_FAILED,{e}")
 
+    max_workers = min(len(SYMBOLS), 6) or 1  # limit concurrency to a small number to reduce rate pressure
+
+    last_heartbeat = time.time()
     while True:
-        for symbol in SYMBOLS:
-            analyze_symbol(symbol, last_sent_poi)
+        start_time = time.time()
 
-        print(f"\n🕒 Cycle complete. Waiting {LOOP_INTERVAL}s before next scan...", end="", flush=True)
-        for sec in range(LOOP_INTERVAL, 0, -1):
-            print(f"\r🕒 Next cycle in {sec:02d}s...", end="", flush=True)
-            time.sleep(1)
-        print("\r🕒 Starting next cycle...                           ", flush=True)
+        # Use ThreadPoolExecutor to parallelize I/O-bound symbol updates/analysis
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor.map(analyze_symbol, SYMBOLS)
+
+        # Save POI state once per cycle (persistent duplicate protection)
+        save_last_sent_poi()
+
+        # --- Compute smart sleep: wake near next candle close but at most LOOP_INTERVAL ---
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        time_to_next_candle_ms = TIMEFRAME_MS - (now_ms % TIMEFRAME_MS)
+        sleep_seconds = min(LOOP_INTERVAL, max(1, time_to_next_candle_ms / 1000.0))
+
+        elapsed = time.time() - start_time
+        # ensure we don't oversleep if processing already took longer
+        sleep_seconds = max(0, sleep_seconds - elapsed)
+
+        logging.debug(f"Cycle done. Sleeping {sleep_seconds:.1f}s")
+
+        # --- Heartbeat while sleeping ---
+        sleep_start = time.time()
+        while time.time() - sleep_start < sleep_seconds:
+            # check if it's time to send heartbeat
+            if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
+                logging.info("💓 Heartbeat: bot alive and waiting for next candle...")
+                last_heartbeat = time.time()
+            time.sleep(1)  # check heartbeat every 1 second
 
 # ===================== ENTRY POINT =====================
 if __name__ == "__main__":
     try:
         main_loop()
     except KeyboardInterrupt:
-        print("\n\n🛑 Script stopped by user.")
+        logging.info("Script stopped by user.")
