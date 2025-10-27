@@ -277,27 +277,30 @@ def analyze_symbol(symbol: str):
             logging.info(f"{symbol},NO_DATA,No OHLCV cached")
             return
 
+        # Skip if no new candle since last analysis
         if not added:
             logging.debug(f"{symbol},SKIP,No new candle")
             return
 
+        # --- Run POI detection ---
         poi_detector = detectors[symbol]["poi"]
         df_tail = df.tail(300).copy()
-
         result = poi_detector.find_pois(df_tail)
         pois = result.get("pois", [])
-
         if not pois:
             logging.info(f"{symbol},NO_POI,No POIs detected")
             return
 
         latest_poi = pois[-1]
-        ob_top, ob_bottom = latest_poi.get("ob_top"), latest_poi.get("ob_bottom")
-        fvg_top, fvg_bottom = latest_poi.get("fvg_top"), latest_poi.get("fvg_bottom")
+        ob_top = latest_poi.get("ob_top")
+        ob_bottom = latest_poi.get("ob_bottom")
+        fvg_top = latest_poi.get("fvg_top")
+        fvg_bottom = latest_poi.get("fvg_bottom")
         protected_price = latest_poi.get("protected_price")
+        protected_type = latest_poi.get("protected_type", "")
         current_price = float(df_tail["close"].iloc[-1])
 
-        # Quick degenerate filters
+        # --- Quick degeneracy filters ---
         if (
             ob_top is None or ob_bottom is None or
             abs((ob_top or 0) - (ob_bottom or 0)) < 1e-8 or
@@ -307,7 +310,7 @@ def analyze_symbol(symbol: str):
             logging.info(f"{symbol},POI_SKIPPED,Degenerate POI values")
             return
 
-        # ATR sanity check
+        # --- ATR sanity check ---
         atr_val = notifier._calculate_atr(df_tail)
         if (
             atr_val is None or pd.isna(atr_val) or
@@ -317,22 +320,27 @@ def analyze_symbol(symbol: str):
             logging.info(f"{symbol},POI_SKIPPED,ATR invalid or too small ({atr_val})")
             return
 
-        # Mislabel correction
-        if "Low" in latest_poi.get("protected_type", "") and protected_price > current_price:
+        # --- Mislabel correction (swap wrong side) ---
+        if "Low" in protected_type and protected_price > current_price:
             latest_poi["protected_type"] = "Protected High"
-        elif "High" in latest_poi.get("protected_type", "") and protected_price < current_price:
+        elif "High" in protected_type and protected_price < current_price:
             latest_poi["protected_type"] = "Protected Low"
 
-        # Unique hash to prevent duplicates
+        # --- Smarter duplicate signature (structure-based, rounded to 3 decimals) ---
+        side = "BUY" if "Low" in latest_poi["protected_type"] else "SELL"
+        key_price = round(protected_price, 3)
+        ob_top_r = round(ob_top or 0, 3)
+        ob_bottom_r = round(ob_bottom or 0, 3)
+        fvg_top_r = round(fvg_top or 0, 3)
+        fvg_bottom_r = round(fvg_bottom or 0, 3)
+
         poi_signature_str = (
-            f"{symbol}_{TIMEFRAME}_"
-            f"{latest_poi.get('protected_type')}_"
-            f"{round(protected_price, 4)}_"
-            f"{round(ob_top or 0, 4)}_{round(ob_bottom or 0, 4)}_"
-            f"{round(fvg_top or 0, 4)}_{round(fvg_bottom or 0, 4)}"
+            f"{symbol}_{TIMEFRAME}_{side}_"
+            f"{key_price}_{ob_top_r}_{ob_bottom_r}_{fvg_top_r}_{fvg_bottom_r}"
         )
         poi_hash = hashlib.sha256(poi_signature_str.encode()).hexdigest()
 
+        # --- Duplicate protection check (persistent) ---
         with state_lock:
             prev_entry = last_sent_poi.get(symbol)
             prev_hash = prev_entry.get("hash") if isinstance(prev_entry, dict) else prev_entry
@@ -340,20 +348,26 @@ def analyze_symbol(symbol: str):
                 logging.info(f"{symbol},POI_SKIPPED,Duplicate POI (persistent)")
                 return
 
+        # --- Message validation ---
         msg = notifier._build_message(latest_poi, df_tail, timeframe=TIMEFRAME)
         if not msg or f"ATR({ATR_PERIOD}):</b> <i>0.00" in msg:
             logging.info(f"{symbol},POI_SKIPPED,Invalid or zero ATR in message")
             return
 
+        # --- Send notification ---
         notifier.send_poi(latest_poi, df_tail)
         logging.info(f"{symbol},POI_SENT,{json.dumps(latest_poi)}")
 
-        # Update in-memory state (timestamped)
+        # --- Save hash for persistence ---
         with state_lock:
             last_sent_poi[symbol] = {"hash": poi_hash, "timestamp": time.time()}
 
+        # write persistent hashes once per cycle in main_loop
+        # (handled in main loop to avoid file writes from multiple threads)
+
     except Exception as e:
         logging.error(f"{symbol},ERROR,{e}")
+
 
 
 
