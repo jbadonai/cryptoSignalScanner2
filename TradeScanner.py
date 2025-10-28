@@ -355,7 +355,7 @@ def analyze_symbol(symbol: str):
             return
 
         # --- Send notification ---
-        notifier.send_poi(latest_poi, df_tail)
+        notifier.send_poi(latest_poi, df_tail, timeframe=TIMEFRAME)
         logging.info(f"{symbol},POI_SENT,{json.dumps(latest_poi)}")
 
         # --- Save persistent hash ---

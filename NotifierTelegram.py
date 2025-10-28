@@ -235,7 +235,7 @@ class NotifierTelegramOld:
         return f"{value:.{self.symbol_precision}f}"
 
     # ----------------------------------------------------------------------
-    def _build_message(self, poi: dict, df: pd.DataFrame) -> str:
+    def _build_message_old(self, poi: dict, df: pd.DataFrame) -> str:
         """Build the Telegram message body for a detected POI."""
         atr_val = self._calculate_atr(df)
         direction = poi["protected_type"].lower()
